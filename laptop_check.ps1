@@ -3,15 +3,19 @@
   No Python or installs needed. Easiest: double-click Run-LaptopCheck.bat.
 
   Checks CPU, RAM, disks (health / SMART), battery wear, Windows version and
-  activation, a short CPU stress test with temperatures, and uptime. Prints a
-  report with red flags and saves it to a text file next to the script.
+  activation, a short CPU stress test with temperatures, uptime, the crash /
+  hardware error history and a quick RAM test. Prints a report with red flags
+  and saves it to a text file next to the script.
 
   Usage:
-    powershell -ExecutionPolicy Bypass -File laptop_check.ps1 [-Seconds 60] [-SkipStress]
+    powershell -ExecutionPolicy Bypass -File laptop_check.ps1 [-Seconds 60] [-SkipStress] [-SkipMemTest]
 #>
 param(
     [int]$Seconds = 30,
     [switch]$SkipStress,
+    [switch]$SkipMemTest,
+    [int]$MemTestSeconds = 45,
+    [int]$HistoryDays = 90,
     [switch]$NoElevate,
     [switch]$NoPause,
     [switch]$Elevated
@@ -28,7 +32,9 @@ $IsAdmin = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administ
 if (-not $IsAdmin -and -not $NoElevate -and -not $Elevated) {
     Write-Host 'Requesting administrator rights (needed for disk SMART data and temperatures)...'
     $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"", '-Elevated', '-Seconds', $Seconds)
+    $argList += @('-MemTestSeconds', $MemTestSeconds, '-HistoryDays', $HistoryDays)
     if ($SkipStress) { $argList += '-SkipStress' }
+    if ($SkipMemTest) { $argList += '-SkipMemTest' }
     if ($NoPause) { $argList += '-NoPause' }
     try {
         Start-Process -FilePath 'powershell.exe' -ArgumentList $argList -Verb RunAs -ErrorAction Stop
@@ -153,7 +159,7 @@ $Stamp = Get-Date -Format 'yyyyMMdd_HHmm'
 $Facts = [ordered]@{}
 
 Out-Line 'USED LAPTOP INSPECTION REPORT' 'HEAD'
-Out-Line 'Collecting data - this takes about a minute plus the stress test...'
+Out-Line 'Collecting data - this takes about 3 minutes...'
 
 # ---------------------------------------------------------------- 0. system
 
@@ -592,6 +598,283 @@ Out-KV 'Last boot' $os.LastBootUpTime.ToString('yyyy-MM-dd HH:mm:ss')
 Out-KV 'Uptime' (Duration-Str ((Get-Date) - $os.LastBootUpTime).TotalSeconds)
 $pw = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power' -ErrorAction SilentlyContinue
 if ($pw.HiberbootEnabled -eq 1) { Out-Line "  -> Fast Startup is ON: 'Shut down' does not reset uptime, only 'Restart' does." }
+
+# ---------------------------------------------------------------- 8. error history
+
+Out-Section "8. CRASH & HARDWARE ERROR HISTORY (last $HistoryDays days)" 'Error history'
+# Bugcheck (blue screen) code -> name, likely cause, severity
+$Bugchecks = @{
+    0x0A = @('IRQL_NOT_LESS_OR_EQUAL', 'driver or RAM', 'YELLOW')
+    0x1A = @('MEMORY_MANAGEMENT', 'RAM', 'RED')
+    0x1E = @('KMODE_EXCEPTION_NOT_HANDLED', 'driver', 'NOTE')
+    0x3B = @('SYSTEM_SERVICE_EXCEPTION', 'driver', 'NOTE')
+    0x50 = @('PAGE_FAULT_IN_NONPAGED_AREA', 'RAM or driver', 'YELLOW')
+    0x77 = @('KERNEL_STACK_INPAGE_ERROR', 'disk', 'RED')
+    0x7A = @('KERNEL_DATA_INPAGE_ERROR', 'disk', 'RED')
+    0x7E = @('SYSTEM_THREAD_EXCEPTION_NOT_HANDLED', 'driver', 'NOTE')
+    0x9C = @('MACHINE_CHECK_EXCEPTION', 'CPU', 'RED')
+    0x9F = @('DRIVER_POWER_STATE_FAILURE', 'driver', 'NOTE')
+    0xD1 = @('DRIVER_IRQL_NOT_LESS_OR_EQUAL', 'driver', 'NOTE')
+    0xEF = @('CRITICAL_PROCESS_DIED', 'software or disk', 'YELLOW')
+    0xF4 = @('CRITICAL_OBJECT_TERMINATION', 'disk', 'RED')
+    0x101 = @('CLOCK_WATCHDOG_TIMEOUT', 'CPU', 'RED')
+    0x116 = @('VIDEO_TDR_FAILURE', 'GPU or graphics driver', 'YELLOW')
+    0x119 = @('VIDEO_SCHEDULER_INTERNAL_ERROR', 'GPU or graphics driver', 'YELLOW')
+    0x124 = @('WHEA_UNCORRECTABLE_ERROR', 'CPU/RAM hardware or overheating', 'RED')
+    0x12B = @('FAULTY_HARDWARE_CORRUPTED_PAGE', 'RAM', 'RED')
+    0x133 = @('DPC_WATCHDOG_VIOLATION', 'driver or SSD firmware', 'YELLOW')
+    0x139 = @('KERNEL_SECURITY_CHECK_FAILURE', 'driver or RAM', 'YELLOW')
+    0x154 = @('UNEXPECTED_STORE_EXCEPTION', 'disk', 'RED')
+}
+function Get-BugcheckInfo($code) {
+    $c = [int64]$code
+    if ($c -ge 0x10000000) { $c = $c -band 0xFFFFFF }  # e.g. 0x1000007E is the same crash as 0x7E
+    $info = @('unknown', 'unknown', 'NOTE')
+    if ($Bugchecks.ContainsKey([int]$c)) { $info = $Bugchecks[[int]$c] }
+    return [pscustomobject]@{ Code = $c; Name = $info[0]; Cause = $info[1]; Level = $info[2] }
+}
+
+$since = (Get-Date).AddDays(-$HistoryDays)
+$hist = @()
+$queries = @(
+    @{ ProviderName = 'Microsoft-Windows-WER-SystemErrorReporting'; Id = 1001 },
+    @{ ProviderName = 'Microsoft-Windows-Kernel-Power'; Id = 41 },
+    @{ ProviderName = 'Microsoft-Windows-WHEA-Logger' },
+    @{ ProviderName = 'disk'; Id = @(7, 51, 153) },
+    @{ ProviderName = 'Microsoft-Windows-MemoryDiagnostics-Results' },
+    @{ ProviderName = 'Microsoft-Windows-Eventlog'; Id = 104 }
+)
+foreach ($q in $queries) {
+    $q.LogName = 'System'; $q.StartTime = $since
+    $found = @()
+    try { $found = @(Get-WinEvent -FilterHashtable $q -MaxEvents 300 -ErrorAction Stop) } catch {}
+    foreach ($ev in $found) {
+        $vals = @($ev.Properties | ForEach-Object { $_.Value })
+        $code = $null; $button = $false
+        if ($ev.Id -eq 41) {
+            if ($vals.Count -gt 0) { $code = [int64]$vals[0] }
+            if ($vals.Count -gt 6) { $button = ([int64]$vals[6] -ne 0) }
+        } elseif ($ev.Id -eq 1001) {
+            $m = [regex]::Match((($vals -join ' ') + ' ' + $ev.Message), '0x([0-9a-fA-F]{1,8})\b')
+            if ($m.Success) { $code = [Convert]::ToInt64($m.Groups[1].Value, 16) }
+        }
+        $hist += [pscustomobject]@{ Time = $ev.TimeCreated; Provider = $ev.ProviderName; Id = $ev.Id; Level = [int]$ev.Level; Code = $code; Button = $button }
+    }
+}
+
+$oldest = $null
+try { $oldest = (Get-WinEvent -LogName System -MaxEvents 1 -Oldest -ErrorAction Stop).TimeCreated } catch {}
+if ($oldest) {
+    $covered = [int]((Get-Date) - $oldest).TotalDays
+    Out-KV 'Event log goes back to' ('{0} ({1} days)' -f $oldest.ToString('yyyy-MM-dd'), $covered)
+    if ($covered -lt 30) { Add-Flag 'NOTE' "The event log only goes back $covered days - older problems are not visible." }
+}
+
+# Blue screens: BugCheck 1001 events, plus Kernel-Power 41 with a bugcheck code
+# that has no matching 1001 event (both are logged for the same crash).
+$bsods = @($hist | Where-Object { $_.Provider -eq 'Microsoft-Windows-WER-SystemErrorReporting' -and $_.Code })
+$power = @($hist | Where-Object { $_.Provider -eq 'Microsoft-Windows-Kernel-Power' })
+foreach ($ev in $power) {
+    if ($ev.Code) {
+        $t = $ev.Time
+        $dup = @($bsods | Where-Object { [math]::Abs(($_.Time - $t).TotalSeconds) -lt 900 })
+        if ($dup.Count -eq 0) { $bsods += $ev }
+    }
+}
+Out-KV 'Blue screens (BSOD)' $bsods.Count
+$bsodRows = @($bsods | Sort-Object Time | ForEach-Object {
+    $i = Get-BugcheckInfo $_.Code
+    [pscustomobject]@{ Code = $i.Code; Name = $i.Name; Cause = $i.Cause; Level = $i.Level; Date = $_.Time.ToString('yyyy-MM-dd') }
+})
+foreach ($g in @($bsodRows | Group-Object Code)) {
+    $f = $g.Group[0]
+    $n = $g.Count
+    Out-Line ('    - 0x{0:X} {1} x{2} (last {3}) -> likely cause: {4}' -f $f.Code, $f.Name, $n, @($g.Group)[-1].Date, $f.Cause)
+    if ($f.Level -eq 'RED') { Add-Flag 'RED' ('Blue screen 0x{0:X} {1} x{2} - points to a {3} problem.' -f $f.Code, $f.Name, $n, $f.Cause) }
+    elseif ($f.Level -eq 'YELLOW' -or $n -ge 3) { Add-Flag 'YELLOW' ('Blue screen 0x{0:X} {1} x{2} - possible {3} problem.' -f $f.Code, $f.Name, $n, $f.Cause) }
+    else { Add-Flag 'NOTE' ('Blue screen 0x{0:X} {1} x{2} - usually a {3} issue.' -f $f.Code, $f.Name, $n, $f.Cause) }
+}
+
+$unexpected = @($power | Where-Object { -not $_.Code -and -not $_.Button })
+$forced = @($power | Where-Object { -not $_.Code -and $_.Button })
+Out-KV 'Unexpected shutdowns' "$($unexpected.Count)  (+$($forced.Count) forced off with the power button)"
+if ($unexpected.Count -ge 3) { Add-Flag 'YELLOW' "$($unexpected.Count) unexpected shutdowns - possible overheating, power or battery problem." }
+elseif ($unexpected.Count -gt 0) { Add-Flag 'NOTE' "$($unexpected.Count) unexpected shutdown(s) - can also be a dead battery or a power cut." }
+if ($forced.Count -ge 3) { Add-Flag 'NOTE' "Forced off with the power button $($forced.Count) times - the laptop may freeze." }
+
+$whea = @($hist | Where-Object { $_.Provider -eq 'Microsoft-Windows-WHEA-Logger' })
+$wheaKinds = @{ 17 = 'corrected PCIe/bus error'; 18 = 'fatal CPU error'; 19 = 'corrected CPU error'; 47 = 'corrected memory error' }
+Out-KV 'Hardware errors (WHEA)' $whea.Count
+foreach ($g in @($whea | Group-Object Id, Level)) {
+    $f = $g.Group[0]
+    $kind = "hardware error (event $($f.Id))"
+    if ($wheaKinds.ContainsKey([int]$f.Id)) { $kind = $wheaKinds[[int]$f.Id] }
+    $fatal = ($f.Level -eq 1 -or $f.Level -eq 2)
+    $last = (@($g.Group | Sort-Object Time)[-1]).Time.ToString('yyyy-MM-dd')
+    $fatalText = ''
+    if ($fatal) { $fatalText = ' (FATAL)' }
+    Out-Line "    - $kind$fatalText x$($g.Count) (last $last)"
+    if ($fatal) { Add-Flag 'RED' "Fatal hardware error logged x$($g.Count): $kind." }
+    elseif ($f.Id -eq 19 -or $f.Id -eq 47) { Add-Flag 'YELLOW' "$kind x$($g.Count) - the CPU/RAM reported errors it had to correct." }
+    else { Add-Flag 'NOTE' "$kind x$($g.Count) - often harmless, but worth noting." }
+}
+
+$diskEv = @($hist | Where-Object { $_.Provider -eq 'disk' })
+Out-KV 'Disk errors in log' $diskEv.Count
+foreach ($d in @(@(7, 'bad block on disk', 'RED'), @(51, 'disk paging error', 'YELLOW'), @(153, 'disk I/O retried', 'YELLOW'))) {
+    $hits = @($diskEv | Where-Object { $_.Id -eq $d[0] } | Sort-Object Time)
+    if ($hits.Count -gt 0) {
+        Out-Line ('    - {0} x{1} (last {2})' -f $d[1], $hits.Count, $hits[-1].Time.ToString('yyyy-MM-dd'))
+        Add-Flag $d[2] "Event log shows '$($d[1])' x$($hits.Count)."
+    }
+}
+
+$memdiag = @($hist | Where-Object { $_.Provider -eq 'Microsoft-Windows-MemoryDiagnostics-Results' } | Sort-Object Time)
+if ($memdiag.Count -gt 0) {
+    $failed = @($memdiag | Where-Object { $_.Level -ge 1 -and $_.Level -le 3 })
+    $txt = 'run {0} time(s), last {1}' -f $memdiag.Count, $memdiag[-1].Time.ToString('yyyy-MM-dd')
+    if ($failed.Count -gt 0) { $txt += " - ERRORS FOUND $($failed.Count) time(s)" } else { $txt += ' - no errors' }
+    Out-KV 'Windows Memory Diagnostic' $txt
+    if ($failed.Count -gt 0) { Add-Flag 'RED' 'Windows Memory Diagnostic found RAM errors in the past.' }
+} else {
+    Out-KV 'Windows Memory Diagnostic' 'never run in this period'
+}
+
+$dumps = @()
+try { $dumps = @(Get-ChildItem "$env:SystemRoot\Minidump\*.dmp" -ErrorAction Stop | Sort-Object LastWriteTime -Descending | ForEach-Object { $_.LastWriteTime.ToString('yyyy-MM-dd') }) } catch {}
+if ($dumps.Count -gt 0) {
+    Out-KV 'Crash dump files' "$($dumps.Count) (latest $($dumps[0]))"
+    if ($bsods.Count -eq 0) { Add-Flag 'NOTE' "$($dumps.Count) crash dump file(s) exist (latest $($dumps[0])) - there were blue screens earlier than the event log shows." }
+} else {
+    Out-KV 'Crash dump files' 'none'
+}
+
+$cleared = @($hist | Where-Object { $_.Provider -eq 'Microsoft-Windows-Eventlog' -and $_.Id -eq 104 })
+if ($cleared.Count -gt 0) {
+    $dates = (@($cleared | ForEach-Object { $_.Time.ToString('yyyy-MM-dd') } | Sort-Object -Unique)) -join ', '
+    Out-KV 'Event log cleared' $dates
+    Add-Flag 'YELLOW' "The System event log was cleared ($dates) - earlier history is gone. Can be innocent (cleanup tools), but ask why."
+}
+if ($bsods.Count + $unexpected.Count + $whea.Count + $diskEv.Count + $cleared.Count -eq 0) { Out-Ok 'No crashes or hardware errors logged.' }
+$Facts["Last $HistoryDays days"] = '{0} BSOD, {1} hardware errors, {2} unexpected shutdowns' -f $bsods.Count, $whea.Count, $unexpected.Count
+
+# ---------------------------------------------------------------- 9. quick RAM test
+
+$MemTestCode = @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+
+public static class LaptopMemTest {
+    [StructLayout(LayoutKind.Sequential)]
+    private class MemStatus {
+        public uint Length = 64; public uint Load;
+        public ulong TotalPhys; public ulong AvailPhys; public ulong TotalPage; public ulong AvailPage;
+        public ulong TotalVirtual; public ulong AvailVirtual; public ulong AvailExtended;
+    }
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GlobalMemoryStatusEx([In, Out] MemStatus status);
+
+    public static ulong TotalPhysical() { MemStatus s = new MemStatus(); GlobalMemoryStatusEx(s); return s.TotalPhys; }
+    public static ulong AvailablePhysical() { MemStatus s = new MemStatus(); GlobalMemoryStatusEx(s); return s.AvailPhys; }
+
+    public static byte[][] Allocate(long target, int chunkSize) {
+        List<byte[]> list = new List<byte[]>();
+        try {
+            while ((long)(list.Count + 1) * chunkSize <= target) list.Add(new byte[chunkSize]);
+        } catch (OutOfMemoryException) {
+            if (list.Count > 0) list.RemoveAt(list.Count - 1);
+        }
+        return list.ToArray();
+    }
+
+    // Writes every chunk first, then verifies all of them, so a write that
+    // corrupts another address is caught too. Returns corrupted 4 KB blocks.
+    public static long Pass(byte[][] chunks, int mode, int pass) {
+        for (int c = 0; c < chunks.Length; c++) Fill(chunks[c], mode, Seed(c, pass));
+        long bad = 0;
+        for (int c = 0; c < chunks.Length; c++) bad += Verify(chunks[c], mode, Seed(c, pass));
+        return bad;
+    }
+
+    private static uint Seed(int chunk, int pass) {
+        uint s = ((uint)(chunk + 1) * 2654435761u) ^ ((uint)pass * 40503u);
+        return s == 0 ? 1u : s;
+    }
+
+    private static byte Fixed(int mode) {
+        switch (mode) { case 0: return 0x00; case 1: return 0xFF; case 2: return 0x55; default: return 0xAA; }
+    }
+
+    private static void Fill(byte[] b, int mode, uint x) {
+        if (mode < 4) { byte v = Fixed(mode); for (int i = 0; i < b.Length; i++) b[i] = v; return; }
+        for (int i = 0; i < b.Length; i++) { x ^= x << 13; x ^= x >> 17; x ^= x << 5; b[i] = (byte)x; }
+    }
+
+    private static long Verify(byte[] b, int mode, uint x) {
+        long bad = 0;
+        bool blockBad = false;
+        byte v = Fixed(mode);
+        for (int i = 0; i < b.Length; i++) {
+            byte expect = v;
+            if (mode == 4) { x ^= x << 13; x ^= x >> 17; x ^= x << 5; expect = (byte)x; }
+            if (b[i] != expect) blockBad = true;
+            if ((i & 4095) == 4095) { if (blockBad) bad++; blockBad = false; }
+        }
+        if (blockBad) bad++;
+        return bad;
+    }
+}
+'@
+
+if (-not $SkipMemTest) {
+    if ($MemTestSeconds -lt 5) { $MemTestSeconds = 5 }
+    Out-Section '9. QUICK MEMORY (RAM) TEST' 'Memory test'
+    $memReady = $true
+    try { if (-not ('LaptopMemTest' -as [type])) { Add-Type -TypeDefinition $MemTestCode -Language CSharp -ErrorAction Stop } }
+    catch { $memReady = $false; Add-Flag 'YELLOW' "Could not start the RAM test: $($_.Exception.Message)" }
+    if ($memReady) {
+        $totalPhys = [double][LaptopMemTest]::TotalPhysical()
+        # Use 60% of the free RAM (max 8 GB) so Windows and open apps keep running normally.
+        $target = [math]::Min([double][LaptopMemTest]::AvailablePhysical() * 0.6, 8GB)
+        $chunks = [LaptopMemTest]::Allocate([int64]$target, 64MB)
+        if ($chunks.Length -eq 0) {
+            Add-Flag 'YELLOW' 'Not enough free memory for the RAM test.'
+        } else {
+            $tested = [double]$chunks.Length * 64MB
+            Out-KV 'Memory tested' ('{0} of {1} ({2:N0}% - the part that was free)' -f (Size-Str $tested -Binary), (Size-Str $totalPhys -Binary), ($tested / $totalPhys * 100))
+            Out-Line "  Writing and verifying patterns for about $MemTestSeconds s..."
+            $patternNames = @('zeros', 'ones', '0x55', '0xAA', 'random')
+            $badBlocks = [int64]0
+            $pass = 0
+            $sw = [Diagnostics.Stopwatch]::StartNew()
+            $finished = $false
+            while (-not $finished) {
+                for ($mode = 0; $mode -lt 5; $mode++) {
+                    $pass++
+                    $t0 = $sw.Elapsed.TotalSeconds
+                    $errs = [LaptopMemTest]::Pass($chunks, $mode, $pass)
+                    $badBlocks += $errs
+                    $res = 'OK'
+                    if ($errs -gt 0) { $res = "$errs corrupted 4 KB blocks" }
+                    Out-Line ('    pass {0} ({1}): {2}  [{3:N1} s]' -f $pass, $patternNames[$mode], $res, ($sw.Elapsed.TotalSeconds - $t0))
+                    if ($pass -ge 5 -and $sw.Elapsed.TotalSeconds -ge $MemTestSeconds) { $finished = $true; break }
+                }
+            }
+            $chunks = $null
+            [GC]::Collect()
+            if ($badBlocks -gt 0) {
+                Add-Flag 'RED' "RAM test found $badBlocks corrupted 4 KB blocks - faulty memory. Confirm with MemTest86 before buying."
+                $Facts['RAM test'] = 'ERRORS FOUND ({0} tested, {1} passes)' -f (Size-Str $tested -Binary), $pass
+            } else {
+                Out-Ok ('No errors in {0} over {1} passes.' -f (Size-Str $tested -Binary), $pass)
+                $Facts['RAM test'] = 'OK ({0} tested, {1} passes)' -f (Size-Str $tested -Binary), $pass
+            }
+            Out-Line '  -> Quick test of the free memory only. A full test: MemTest86 from a USB stick'
+            Out-Line '     (1+ hour) or Windows Memory Diagnostic (mdsched.exe, needs a restart).'
+        }
+    }
+}
 
 # ---------------------------------------------------------------- summary
 

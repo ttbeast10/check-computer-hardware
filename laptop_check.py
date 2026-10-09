@@ -3,7 +3,8 @@
 laptop_check.py - inspect a used Windows 10/11 laptop before buying it.
 
 Checks CPU, RAM, disks (health / SMART), battery wear, Windows version and
-activation, runs a short CPU stress test with temperatures, and reports uptime.
+activation, runs a short CPU stress test with temperatures, reports uptime,
+reads the crash / hardware error history and runs a quick RAM test.
 Prints a readable report with red flags and saves it to a text file.
 
 No third-party packages are needed: all data comes from tools built into
@@ -17,6 +18,7 @@ Usage:
     python laptop_check.py                 full check, 30 s stress test
     python laptop_check.py --seconds 60    longer stress test
     python laptop_check.py --skip-stress   no stress test
+    python laptop_check.py --skip-memtest  no RAM test
 """
 
 import argparse
@@ -826,6 +828,277 @@ def section_stress(rep, seconds, cpu):
 
 
 # --------------------------------------------------------------------------
+# Crash / hardware error history (Windows System event log)
+# --------------------------------------------------------------------------
+
+# Bugcheck (blue screen) code -> (name, likely cause, severity)
+BUGCHECKS = {
+    0x0A: ("IRQL_NOT_LESS_OR_EQUAL", "driver or RAM", YELLOW),
+    0x1A: ("MEMORY_MANAGEMENT", "RAM", RED),
+    0x1E: ("KMODE_EXCEPTION_NOT_HANDLED", "driver", NOTE),
+    0x3B: ("SYSTEM_SERVICE_EXCEPTION", "driver", NOTE),
+    0x50: ("PAGE_FAULT_IN_NONPAGED_AREA", "RAM or driver", YELLOW),
+    0x77: ("KERNEL_STACK_INPAGE_ERROR", "disk", RED),
+    0x7A: ("KERNEL_DATA_INPAGE_ERROR", "disk", RED),
+    0x7E: ("SYSTEM_THREAD_EXCEPTION_NOT_HANDLED", "driver", NOTE),
+    0x9C: ("MACHINE_CHECK_EXCEPTION", "CPU", RED),
+    0x9F: ("DRIVER_POWER_STATE_FAILURE", "driver", NOTE),
+    0xD1: ("DRIVER_IRQL_NOT_LESS_OR_EQUAL", "driver", NOTE),
+    0xEF: ("CRITICAL_PROCESS_DIED", "software or disk", YELLOW),
+    0xF4: ("CRITICAL_OBJECT_TERMINATION", "disk", RED),
+    0x101: ("CLOCK_WATCHDOG_TIMEOUT", "CPU", RED),
+    0x116: ("VIDEO_TDR_FAILURE", "GPU or graphics driver", YELLOW),
+    0x119: ("VIDEO_SCHEDULER_INTERNAL_ERROR", "GPU or graphics driver", YELLOW),
+    0x124: ("WHEA_UNCORRECTABLE_ERROR", "CPU/RAM hardware or overheating", RED),
+    0x12B: ("FAULTY_HARDWARE_CORRUPTED_PAGE", "RAM", RED),
+    0x133: ("DPC_WATCHDOG_VIOLATION", "driver or SSD firmware", YELLOW),
+    0x139: ("KERNEL_SECURITY_CHECK_FAILURE", "driver or RAM", YELLOW),
+    0x154: ("UNEXPECTED_STORE_EXCEPTION", "disk", RED),
+}
+WHEA_KINDS = {17: "corrected PCIe/bus error", 18: "fatal CPU error", 19: "corrected CPU error",
+              47: "corrected memory error"}
+DISK_EVENTS = {7: ("bad block on disk", RED), 51: ("disk paging error", YELLOW),
+               153: ("disk I/O retried", YELLOW)}
+
+PS_HISTORY = r"""
+$since = (Get-Date).AddDays(-__DAYS__)
+$events = @()
+$queries = @(
+  @{ ProviderName = 'Microsoft-Windows-WER-SystemErrorReporting'; Id = 1001 },
+  @{ ProviderName = 'Microsoft-Windows-Kernel-Power'; Id = 41 },
+  @{ ProviderName = 'Microsoft-Windows-WHEA-Logger' },
+  @{ ProviderName = 'disk'; Id = @(7, 51, 153) },
+  @{ ProviderName = 'Microsoft-Windows-MemoryDiagnostics-Results' },
+  @{ ProviderName = 'Microsoft-Windows-Eventlog'; Id = 104 }
+)
+foreach ($q in $queries) {
+  $q.LogName = 'System'; $q.StartTime = $since
+  $found = @()
+  try { $found = @(Get-WinEvent -FilterHashtable $q -MaxEvents 300 -ErrorAction Stop) } catch {}
+  foreach ($e in $found) {
+    $vals = @($e.Properties | ForEach-Object { $_.Value })
+    $code = $null; $button = $false
+    if ($e.Id -eq 41) {
+      if ($vals.Count -gt 0) { $code = [int64]$vals[0] }
+      if ($vals.Count -gt 6) { $button = ([int64]$vals[6] -ne 0) }
+    } elseif ($e.Id -eq 1001) {
+      $m = [regex]::Match((($vals -join ' ') + ' ' + $e.Message), '0x([0-9a-fA-F]{1,8})\b')
+      if ($m.Success) { $code = [Convert]::ToInt64($m.Groups[1].Value, 16) }
+    }
+    $events += [pscustomobject]@{ Time = $e.TimeCreated.ToString('yyyy-MM-dd HH:mm'); Provider = $e.ProviderName; Id = $e.Id; Level = [int]$e.Level; Code = $code; Button = $button }
+  }
+}
+$dumps = @()
+try { $dumps = @(Get-ChildItem "$env:SystemRoot\Minidump\*.dmp" -ErrorAction Stop | Sort-Object LastWriteTime -Descending | ForEach-Object { $_.LastWriteTime.ToString('yyyy-MM-dd') }) } catch {}
+$oldest = $null
+try { $oldest = (Get-WinEvent -LogName System -MaxEvents 1 -Oldest -ErrorAction Stop).TimeCreated.ToString('yyyy-MM-dd') } catch {}
+[pscustomobject]@{ Events = $events; Dumps = $dumps; Oldest = $oldest }
+"""
+
+
+def bugcheck_info(code):
+    code = int(code or 0)
+    if code >= 0x10000000:  # e.g. 0x1000007E is the same crash as 0x7E
+        code &= 0xFFFFFF
+    name, cause, level = BUGCHECKS.get(code, ("unknown", "unknown", NOTE))
+    return code, name, cause, level
+
+
+def section_history(rep, days):
+    rep.section(f"8. CRASH & HARDWARE ERROR HISTORY (last {days} days)", "Error history")
+    data = ps_json(PS_HISTORY.replace("__DAYS__", str(days)))
+    if data is None:
+        rep.flag(YELLOW, "Could not read the Windows event log.")
+        return None
+    events = as_list(data.get("Events"))
+    dumps = as_list(data.get("Dumps"))
+
+    def when(e):
+        return dt.datetime.strptime(e["Time"], "%Y-%m-%d %H:%M")
+
+    def of(provider, ids=None):
+        return [e for e in events if e.get("Provider") == provider and (ids is None or e.get("Id") in ids)]
+
+    # Blue screens: BugCheck 1001 events, plus Kernel-Power 41 with a bugcheck code
+    # that has no matching 1001 event (both are logged for the same crash).
+    bsods = [e for e in of("Microsoft-Windows-WER-SystemErrorReporting", [1001]) if e.get("Code")]
+    power = of("Microsoft-Windows-Kernel-Power", [41])
+    for e in power:
+        if e.get("Code") and not any(abs((when(e) - when(b)).total_seconds()) < 900 for b in bsods):
+            bsods.append(e)
+    unexpected = [e for e in power if not e.get("Code") and not e.get("Button")]
+    forced = [e for e in power if not e.get("Code") and e.get("Button")]
+    whea = of("Microsoft-Windows-WHEA-Logger")
+    disk = of("disk")
+    memdiag = of("Microsoft-Windows-MemoryDiagnostics-Results")
+    cleared = of("Microsoft-Windows-Eventlog", [104])
+
+    oldest = data.get("Oldest")
+    if oldest:
+        covered = (dt.datetime.now() - dt.datetime.strptime(oldest, "%Y-%m-%d")).days
+        rep.kv("Event log goes back to", f"{oldest} ({covered} days)")
+        if covered < 30:
+            rep.flag(NOTE, f"The event log only goes back {covered} days - older problems are not visible.")
+
+    rep.kv("Blue screens (BSOD)", len(bsods))
+    groups = {}
+    for e in sorted(bsods, key=when):
+        groups.setdefault(bugcheck_info(e["Code"])[0], []).append(e["Time"][:10])
+    for code, dates in groups.items():
+        _, name, cause, level = bugcheck_info(code)
+        rep.line(f"    - 0x{code:X} {name} x{len(dates)} (last {dates[-1]}) -> likely cause: {cause}")
+        if level == RED:
+            rep.flag(RED, f"Blue screen 0x{code:X} {name} x{len(dates)} - points to a {cause} problem.")
+        elif level == YELLOW or len(dates) >= 3:
+            rep.flag(YELLOW, f"Blue screen 0x{code:X} {name} x{len(dates)} - possible {cause} problem.")
+        else:
+            rep.flag(NOTE, f"Blue screen 0x{code:X} {name} x{len(dates)} - usually a {cause} issue.")
+
+    rep.kv("Unexpected shutdowns", f"{len(unexpected)}  (+{len(forced)} forced off with the power button)")
+    if len(unexpected) >= 3:
+        rep.flag(YELLOW, f"{len(unexpected)} unexpected shutdowns - possible overheating, power or battery problem.")
+    elif unexpected:
+        rep.flag(NOTE, f"{len(unexpected)} unexpected shutdown(s) - can also be a dead battery or a power cut.")
+    if len(forced) >= 3:
+        rep.flag(NOTE, f"Forced off with the power button {len(forced)} times - the laptop may freeze.")
+
+    rep.kv("Hardware errors (WHEA)", len(whea))
+    by_id = {}
+    for e in whea:
+        by_id.setdefault((e.get("Id"), e.get("Level")), []).append(e["Time"][:10])
+    for (eid, level), dates in sorted(by_id.items(), key=lambda x: str(x[0])):
+        kind = WHEA_KINDS.get(eid, f"hardware error (event {eid})")
+        fatal = level in (1, 2)
+        rep.line(f"    - {kind}{' (FATAL)' if fatal else ''} x{len(dates)} (last {max(dates)})")
+        if fatal:
+            rep.flag(RED, f"Fatal hardware error logged x{len(dates)}: {kind}.")
+        elif eid in (19, 47):
+            rep.flag(YELLOW, f"{kind} x{len(dates)} - the CPU/RAM reported errors it had to correct.")
+        else:
+            rep.flag(NOTE, f"{kind} x{len(dates)} - often harmless, but worth noting.")
+
+    rep.kv("Disk errors in log", len(disk))
+    for eid, (label, level) in DISK_EVENTS.items():
+        hits = [e for e in disk if e.get("Id") == eid]
+        if hits:
+            rep.line(f"    - {label} x{len(hits)} (last {max(e['Time'][:10] for e in hits)})")
+            rep.flag(level, f"Event log shows '{label}' x{len(hits)}.")
+
+    if memdiag:
+        last = max(memdiag, key=when)
+        failed = [e for e in memdiag if (e.get("Level") or 4) <= 3]
+        rep.kv("Windows Memory Diagnostic", f"run {len(memdiag)} time(s), last {last['Time'][:10]}"
+               + (f" - ERRORS FOUND {len(failed)} time(s)" if failed else " - no errors"))
+        if failed:
+            rep.flag(RED, "Windows Memory Diagnostic found RAM errors in the past.")
+    else:
+        rep.kv("Windows Memory Diagnostic", "never run in this period")
+
+    rep.kv("Crash dump files", f"{len(dumps)} (latest {dumps[0]})" if dumps else "none")
+    if dumps and not bsods:
+        rep.flag(NOTE, f"{len(dumps)} crash dump file(s) exist (latest {dumps[0]}) - there were blue screens "
+                       "earlier than the event log shows.")
+
+    if cleared:
+        dates = ", ".join(sorted({e["Time"][:10] for e in cleared}))
+        rep.kv("Event log cleared", dates)
+        rep.flag(YELLOW, f"The System event log was cleared ({dates}) - earlier history is gone. "
+                         "Can be innocent (cleanup tools), but ask why.")
+
+    if not (bsods or unexpected or whea or disk or cleared):
+        rep.ok("No crashes or hardware errors logged.")
+    return f"{len(bsods)} BSOD, {len(whea)} hardware errors, {len(unexpected)} unexpected shutdowns"
+
+
+# --------------------------------------------------------------------------
+# Quick RAM test
+# --------------------------------------------------------------------------
+
+MEMTEST_CHUNK = 64 * 1024 * 1024
+MEMTEST_BLOCK = 4096
+
+
+def memory_status():
+    class MEMORYSTATUSEX(ctypes.Structure):
+        _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong)] + [
+            (n, ctypes.c_ulonglong) for n in ("ullTotalPhys", "ullAvailPhys", "ullTotalPageFile",
+                                              "ullAvailPageFile", "ullTotalVirtual", "ullAvailVirtual",
+                                              "ullAvailExtendedVirtual")]
+    st = MEMORYSTATUSEX()
+    st.dwLength = ctypes.sizeof(st)
+    if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+        return None, None
+    return st.ullTotalPhys, st.ullAvailPhys
+
+
+def section_memtest(rep, budget):
+    rep.section("9. QUICK MEMORY (RAM) TEST", "Memory test")
+    total, avail = memory_status()
+    if not avail:
+        rep.flag(YELLOW, "Could not read free memory - RAM test skipped.")
+        return None
+    # Use 60% of the free RAM (max 8 GB) so Windows and open apps keep running normally.
+    target = min(int(avail * 0.6), 8 * 1024 ** 3)
+    chunks = []
+    try:
+        while (len(chunks) + 1) * MEMTEST_CHUNK <= target:
+            chunks.append(bytearray(MEMTEST_CHUNK))
+    except MemoryError:
+        if chunks:
+            chunks.pop()
+    if not chunks:
+        rep.flag(YELLOW, "Not enough free memory for the RAM test.")
+        return None
+    tested = len(chunks) * MEMTEST_CHUNK
+    rep.kv("Memory tested", f"{size_str(tested, True)} of {size_str(total, True)} "
+                            f"({tested / total * 100:.0f}% - the part that was free)")
+    rep.line(f"  Writing and verifying patterns for about {budget} s...")
+
+    rnd = os.urandom(MEMTEST_CHUNK)
+    patterns = [("zeros", 0x00), ("ones", 0xFF), ("0x55", 0x55), ("0xAA", 0xAA), ("random", None)]
+    bad_blocks, passes, start = 0, 0, time.time()
+    finished = False
+    while not finished:
+        for name, value in patterns:
+            passes += 1
+            fixed = bytes([value]) * MEMTEST_CHUNK if value is not None else None
+
+            def expected(i, p=passes, fixed=fixed):
+                if fixed is not None:
+                    return fixed
+                k = (i * 4099 + p * 131) % MEMTEST_CHUNK  # different data in every chunk and pass
+                return rnd[k:] + rnd[:k]
+
+            t0 = time.time()
+            # Write everything first, then verify, so a write that corrupts
+            # another address is caught too.
+            for i, chunk in enumerate(chunks):
+                chunk[:] = expected(i)
+            errors = 0
+            for i, chunk in enumerate(chunks):
+                ref = expected(i)
+                if chunk != ref:
+                    errors += sum(1 for o in range(0, MEMTEST_CHUNK, MEMTEST_BLOCK)
+                                  if chunk[o:o + MEMTEST_BLOCK] != ref[o:o + MEMTEST_BLOCK])
+            bad_blocks += errors
+            rep.line(f"    pass {passes} ({name}): "
+                     f"{'OK' if not errors else f'{errors} corrupted 4 KB blocks'}  [{time.time() - t0:.1f} s]")
+            if passes >= len(patterns) and time.time() - start >= budget:
+                finished = True
+                break
+    del chunks
+
+    if bad_blocks:
+        rep.flag(RED, f"RAM test found {bad_blocks} corrupted 4 KB blocks - faulty memory. "
+                      "Confirm with MemTest86 before buying.")
+    else:
+        rep.ok(f"No errors in {size_str(tested, True)} over {passes} passes.")
+    rep.line("  -> Quick test of the free memory only. A full test: MemTest86 from a USB stick")
+    rep.line("     (1+ hour) or Windows Memory Diagnostic (mdsched.exe, needs a restart).")
+    return ("ERRORS FOUND" if bad_blocks else "OK") + f" ({size_str(tested, True)} tested, {passes} passes)"
+
+
+# --------------------------------------------------------------------------
 # Summary
 # --------------------------------------------------------------------------
 
@@ -885,6 +1158,9 @@ def main():
     ap = argparse.ArgumentParser(description="Inspect a used Windows laptop before buying it.")
     ap.add_argument("--seconds", type=int, default=30, help="stress test length (default 30)")
     ap.add_argument("--skip-stress", action="store_true", help="skip the CPU stress test")
+    ap.add_argument("--skip-memtest", action="store_true", help="skip the quick RAM test")
+    ap.add_argument("--memtest-seconds", type=int, default=45, help="RAM test length (default 45)")
+    ap.add_argument("--history-days", type=int, default=90, help="days of error history to read (default 90)")
     ap.add_argument("--no-admin", action="store_true", help="do not ask for administrator rights")
     ap.add_argument("--no-pause", action="store_true", help="do not wait for Enter at the end")
     ap.add_argument("--elevated", action="store_true", help=argparse.SUPPRESS)
@@ -908,7 +1184,7 @@ def main():
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     rep = Report(use_color=sys.stdout.isatty())
     rep.line("USED LAPTOP INSPECTION REPORT", "HEAD")
-    rep.line("Collecting data - this takes about a minute plus the stress test...")
+    rep.line("Collecting data - this takes about 3 minutes...")
 
     outdir = output_dir()
     stamp = dt.datetime.now().strftime("%Y%m%d_%H%M")
@@ -931,6 +1207,10 @@ def main():
     if not args.skip_stress:
         peak = safe(section_stress, rep, max(5, args.seconds), cpu)
     safe(section_uptime, rep, win[0])
+    history = safe(section_history, rep, max(1, args.history_days))
+    memtest = None
+    if not args.skip_memtest:
+        memtest = safe(section_memtest, rep, max(5, args.memtest_seconds))
 
     facts.append(("Model", f"{clean(system.get('Manufacturer'))} {clean(system.get('Model'))}".strip() or "n/a"))
     facts.append(("CPU", f"{clean(cpu.get('Name'))} ({cpu.get('NumberOfCores')}C/"
@@ -942,6 +1222,10 @@ def main():
                              f"{'activated' if win[1] else 'NOT activated' if win[1] is False else 'activation unknown'}"))
     if peak is not None:
         facts.append(("Peak CPU temperature", f"{peak:.0f} C"))
+    if history:
+        facts.append((f"Last {args.history_days} days", history))
+    if memtest:
+        facts.append(("RAM test", memtest))
     safe(section_summary, rep, facts)
 
     name = clean(system.get("ComputerName")) or "laptop"
