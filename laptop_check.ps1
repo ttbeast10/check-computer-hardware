@@ -228,8 +228,9 @@ foreach ($d in $pdisks) {
     $name = Clean $d.FriendlyName
     if (-not $name) { $name = 'Unknown disk' }
     $bus = [string]$d.BusType
+    if ($bus -eq 'RAID' -and $name.ToUpper().Contains('NVME')) { $bus = 'NVMe (via Intel RST/VMD)' }  # Windows reports these NVMe drives as RAID
     $media = [string]$d.MediaType
-    if ($media -eq 'Unspecified') { if ($bus -eq 'NVMe') { $media = 'SSD?' } else { $media = '?' } }
+    if ($media -eq 'Unspecified') { if ($bus.StartsWith('NVMe')) { $media = 'SSD?' } else { $media = '?' } }
     $letters = ''
     try {
         $letters = (@(Get-Partition -DiskNumber $d.DeviceId -ErrorAction Stop | Where-Object { [string]$_.DriveLetter -match '^[A-Z]$' } | ForEach-Object { [string]$_.DriveLetter + ':' }) -join ' ')
@@ -272,7 +273,7 @@ foreach ($d in $pdisks) {
     if ($media -eq 'HDD' -and $bus -ne 'USB') { Add-Flag 'YELLOW' "$name is a mechanical hard drive - much slower than an SSD." }
     if ($bus -ne 'USB') {
         $kind = $media
-        if ($bus -eq 'NVMe') { $kind = 'NVMe' }
+        if ($bus.StartsWith('NVMe')) { $kind = 'NVMe' }
         $diskSummary += ((Size-Str $d.Size) + ' ' + $kind)
     }
 }
@@ -368,7 +369,21 @@ if ($batts.Count -eq 0) {
     }
 }
 $w32b = @(Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue)
+# Windows reports capacity in mWh; mAh = mWh / volts. Prefer the design (nominal)
+# voltage, fall back to the voltage measured right now.
+$volts = $null
+$mvList = @($w32b | ForEach-Object { $_.DesignVoltage })
+try { $mvList += @(Get-CimInstance -Namespace root/wmi -ClassName BatteryStatus -ErrorAction Stop | ForEach-Object { $_.Voltage }) } catch {}
+foreach ($mv in $mvList) {
+    if (-not $volts -and $mv -ge 5000 -and $mv -le 25000) { $volts = $mv / 1000.0 }
+}
+function Cap-Str([double]$mwh) {
+    $t = '{0:N0} mWh' -f $mwh
+    if ($volts) { $t += ' (~{0:N0} mAh)' -f ($mwh / $volts) }
+    return $t
+}
 $minHealth = $null
+$battSummary = 'n/a'
 if ($batts.Count -eq 0 -and $w32b.Count -eq 0) {
     Add-Flag 'RED' 'No battery detected! (removed, dead, or disconnected)'
 } else {
@@ -382,12 +397,18 @@ if ($batts.Count -eq 0 -and $w32b.Count -eq 0) {
             Out-KV 'Battery' $label
         }
         if ($b.ManufactureDate) { Out-KV 'Manufacture date' $b.ManufactureDate }
-        if ($b.Design) { Out-KV 'Design capacity' ('{0:N0} mWh' -f $b.Design) } else { Out-KV 'Design capacity' 'n/a' }
-        if ($b.Full) { Out-KV 'Current full-charge capacity' ('{0:N0} mWh' -f $b.Full) } else { Out-KV 'Current full-charge capacity' 'n/a' }
+        if ($b.Design) { Out-KV 'Original capacity (when new)' (Cap-Str $b.Design) } else { Out-KV 'Original capacity (when new)' 'n/a' }
+        if ($b.Full) { Out-KV 'Capacity left (full charge)' (Cap-Str $b.Full) } else { Out-KV 'Capacity left (full charge)' 'n/a' }
         if ($b.Design -and $b.Full) {
             $h = $b.Full / $b.Design * 100
-            if ($null -eq $minHealth -or $h -lt $minHealth) { $minHealth = $h }
-            Out-KV 'Battery health' ('{0:N0}%  (wear {1:N0}%)' -f $h, [math]::Max(0, 100 - $h))
+            $unit = 'mWh'; $scale = 1.0
+            if ($volts) { $unit = 'mAh'; $scale = $volts }
+            $left = '{0:N0} {2} of {1:N0} {2}' -f ($b.Full / $scale), ($b.Design / $scale), $unit
+            Out-KV 'Remaining from original' ('{0:N0}%  = {1}  (lost {2:N0}%)' -f $h, $left, [math]::Max(0, 100 - $h))
+            if ($null -eq $minHealth -or $h -lt $minHealth) {
+                $minHealth = $h
+                $battSummary = '{0:N0}% of original ({1})' -f $h, $left
+            }
             if ($h -lt 60) { Add-Flag 'RED' ('Battery health {0:N0}% - plan on replacing the battery.' -f $h) }
             elseif ($h -lt 80) { Add-Flag 'YELLOW' ('Battery health {0:N0}% - noticeably reduced runtime.' -f $h) }
             else { Out-Ok ('Battery health {0:N0}%.' -f $h) }
@@ -402,17 +423,21 @@ if ($batts.Count -eq 0 -and $w32b.Count -eq 0) {
         } else {
             Out-KV 'Charge cycles' 'not reported by the battery'
         }
+        if ($b.Design -and $b.Full -and ($b.Full / $b.Design) -lt 0.8 -and $b.Cycles -and $b.Cycles -lt 100) {
+            Add-Flag 'NOTE' ('Only {0:N0} cycles but {1:N0}% capacity lost - the cycle counter may be unreliable, or the battery aged from time and heat.' -f $b.Cycles, (100 - $b.Full / $b.Design * 100))
+        }
     }
+    if ($volts) { Out-Line ("  -> mAh calculated from mWh at the battery's {0:N2} V." -f $volts) }
     foreach ($w in $w32b) {
         $src = 'charger connected'
         if ($w.BatteryStatus -eq 1) { $src = 'on battery' }
-        Out-KV 'Current charge' "$($w.EstimatedChargeRemaining)%  ($src)"
+        Out-KV 'Charge level right now' "$($w.EstimatedChargeRemaining)%  ($src) - not battery health"
     }
     $html = Join-Path $OutDir "battery-report_$Stamp.html"
     $null = & powercfg /batteryreport /output $html 2>&1
     if (Test-Path $html) { Out-Line "  Detailed battery history saved to: $html" }
 }
-if ($null -ne $minHealth) { $Facts['Battery health'] = '{0:N0}%' -f $minHealth } else { $Facts['Battery health'] = 'n/a' }
+$Facts['Battery health'] = $battSummary
 
 # ---------------------------------------------------------------- 5. Windows
 

@@ -440,8 +440,10 @@ try { $pred = @(Get-CimInstance -Namespace root/wmi -ClassName MSStorageDriver_F
     for d in disks:
         model = clean(d.get("Model")) or "Unknown disk"
         bus, media = d.get("BusType") or "?", d.get("MediaType") or "?"
+        if bus == "RAID" and "NVME" in model.upper():
+            bus = "NVMe (via Intel RST/VMD)"  # Windows reports these NVMe drives as RAID
         if media == "Unspecified":
-            media = "SSD?" if bus == "NVMe" else "?"
+            media = "SSD?" if bus.startswith("NVMe") else "?"
         rep.line()
         rep.line(f"  Disk {d.get('Number')}: {model}")
         rep.kv("    Capacity", size_str(d.get("Size")))
@@ -477,7 +479,7 @@ try { $pred = @(Get-CimInstance -Namespace root/wmi -ClassName MSStorageDriver_F
         if media == "HDD" and bus != "USB":
             rep.flag(YELLOW, f"{model} is a mechanical hard drive - much slower than an SSD.")
         if bus != "USB":
-            summary.append(f"{size_str(d.get('Size'))} {bus if bus == 'NVMe' else media}")
+            summary.append(f"{size_str(d.get('Size'))} {'NVMe' if bus.startswith('NVMe') else media}")
 
     for p in as_list(data.get("Predict")):
         if p.get("PredictFailure"):
@@ -513,14 +515,27 @@ def section_battery(rep, outdir, stamp):
         pass
 
     wmi = ps_json(r"""
-$r = [ordered]@{ Design = @(); Full = @(); Cycles = @(); Win32 = @() }
+$r = [ordered]@{ Design = @(); Full = @(); Cycles = @(); VoltageNow = @(); Win32 = @() }
 try { $r.Design = @(Get-CimInstance -Namespace root/wmi -ClassName BatteryStaticData -ErrorAction Stop | ForEach-Object { $_.DesignedCapacity }) } catch {}
 try { $r.Full = @(Get-CimInstance -Namespace root/wmi -ClassName BatteryFullChargedCapacity -ErrorAction Stop | ForEach-Object { $_.FullChargedCapacity }) } catch {}
 try { $r.Cycles = @(Get-CimInstance -Namespace root/wmi -ClassName BatteryCycleCount -ErrorAction Stop | ForEach-Object { $_.CycleCount }) } catch {}
-$r.Win32 = @(Get-CimInstance Win32_Battery | Select-Object Name, EstimatedChargeRemaining, BatteryStatus)
+try { $r.VoltageNow = @(Get-CimInstance -Namespace root/wmi -ClassName BatteryStatus -ErrorAction Stop | ForEach-Object { $_.Voltage }) } catch {}
+$r.Win32 = @(Get-CimInstance Win32_Battery | Select-Object Name, EstimatedChargeRemaining, BatteryStatus, DesignVoltage)
 [pscustomobject]$r
 """) or {}
     win32 = as_list(wmi.get("Win32"))
+
+    # Windows reports capacity in mWh; mAh = mWh / volts. Prefer the design (nominal)
+    # voltage, fall back to the voltage measured right now.
+    volts = None
+    for mv in [w.get("DesignVoltage") for w in win32] + as_list(wmi.get("VoltageNow")):
+        if num(mv) and 5000 <= num(mv) <= 25000:
+            volts = num(mv) / 1000
+            break
+
+    def cap(mwh):
+        text = f"{mwh:,.0f} mWh"
+        return text + (f" (~{mwh / volts:,.0f} mAh)" if volts else "")
 
     if not batteries:
         design, full, cycles = as_list(wmi.get("Design")), as_list(wmi.get("Full")), as_list(wmi.get("Cycles"))
@@ -535,7 +550,7 @@ $r.Win32 = @(Get-CimInstance Win32_Battery | Select-Object Name, EstimatedCharge
         rep.flag(RED, "No battery detected! (removed, dead, or disconnected)")
         return None
 
-    healths = []
+    summary = None
     for i, b in enumerate(batteries):
         if len(batteries) > 1:
             rep.line(f"  Battery {i + 1}:")
@@ -545,12 +560,15 @@ $r.Win32 = @(Get-CimInstance Win32_Battery | Select-Object Name, EstimatedCharge
             rep.kv("Battery", name + (f" ({clean(b.get('Chemistry'))})" if b.get("Chemistry") else ""))
         if b.get("ManufactureDate"):
             rep.kv("Manufacture date", clean(b.get("ManufactureDate")))
-        rep.kv("Design capacity", f"{design:,.0f} mWh" if design else "n/a")
-        rep.kv("Current full-charge capacity", f"{full:,.0f} mWh" if full else "n/a")
+        rep.kv("Original capacity (when new)", cap(design) if design else "n/a")
+        rep.kv("Capacity left (full charge)", cap(full) if full else "n/a")
         if design and full:
             health = full / design * 100
-            healths.append(health)
-            rep.kv("Battery health", f"{health:.0f}%  (wear {max(0, 100 - health):.0f}%)")
+            unit, scale = ("mAh", volts) if volts else ("mWh", 1)
+            left = f"{full / scale:,.0f} {unit} of {design / scale:,.0f} {unit}"
+            rep.kv("Remaining from original", f"{health:.0f}%  = {left}  (lost {max(0, 100 - health):.0f}%)")
+            if summary is None or health < summary[0]:
+                summary = (health, f"{health:.0f}% of original ({left})")
             if health < 60:
                 rep.flag(RED, f"Battery health {health:.0f}% - plan on replacing the battery.")
             elif health < 80:
@@ -569,16 +587,21 @@ $r.Win32 = @(Get-CimInstance Win32_Battery | Select-Object Name, EstimatedCharge
                 rep.flag(YELLOW, f"{cycles:.0f} charge cycles - battery is well used.")
         else:
             rep.kv("Charge cycles", "not reported by the battery")
+        if design and full and full / design < 0.8 and cycles and cycles < 100:
+            rep.flag(NOTE, f"Only {cycles:.0f} cycles but {100 - full / design * 100:.0f}% capacity lost - the "
+                           "cycle counter may be unreliable, or the battery aged from time and heat.")
+    if volts:
+        rep.line(f"  -> mAh calculated from mWh at the battery's {volts:.2f} V.")
     for w in win32:
         status = int(num(w.get("BatteryStatus")) or 0)
-        rep.kv("Current charge", f"{w.get('EstimatedChargeRemaining')}%  "
-               f"({'on battery' if status == 1 else 'charger connected'})")
+        rep.kv("Charge level right now", f"{w.get('EstimatedChargeRemaining')}%  "
+               f"({'on battery' if status == 1 else 'charger connected'}) - not battery health")
 
     html = os.path.join(outdir, f"battery-report_{stamp}.html")
     run_cmd(["powercfg", "/batteryreport", "/output", html])
     if os.path.exists(html):
         rep.line(f"  Detailed battery history saved to: {html}")
-    return min(healths) if healths else None
+    return summary
 
 
 def dsreg_status():
@@ -902,7 +925,7 @@ def main():
     cpu = safe(section_cpu, rep) or {}
     ram = safe(section_ram, rep) or {}
     disks = safe(section_disks, rep, admin) or []
-    battery_health = safe(section_battery, rep, outdir, stamp)
+    battery = safe(section_battery, rep, outdir, stamp)
     win = safe(section_windows, rep, system) or ({}, None)
     peak = None
     if not args.skip_stress:
@@ -914,7 +937,7 @@ def main():
                          f"{cpu.get('NumberOfLogicalProcessors')}T)" if cpu else "n/a"))
     facts.append(("RAM", f"{size_str(ram.get('total'), True)} {'/'.join(ram.get('types', []))}" if ram else "n/a"))
     facts.append(("Storage", ", ".join(disks) or "n/a"))
-    facts.append(("Battery health", f"{battery_health:.0f}%" if battery_health else "n/a"))
+    facts.append(("Battery health", battery[1] if battery else "n/a"))
     facts.append(("Windows", f"{clean(win[0].get('Caption'))} - "
                              f"{'activated' if win[1] else 'NOT activated' if win[1] is False else 'activation unknown'}"))
     if peak is not None:
