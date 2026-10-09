@@ -3,7 +3,8 @@
   No Python or installs needed. Easiest: double-click Run-LaptopCheck.bat.
 
   Checks CPU, RAM, disks (health / SMART), battery wear, Windows version and
-  activation, a short CPU stress test with temperatures, uptime, the crash /
+  activation, a short CPU stress test that verifies every calculation and
+  measures temperatures, uptime, the crash /
   hardware error history and a quick RAM test. Prints a report with red flags
   and saves it to a text file next to the script.
 
@@ -500,6 +501,89 @@ $Facts['Windows'] = (Clean $os.Caption) + ' - ' + $actText
 
 # ---------------------------------------------------------------- 6. stress test
 
+$CpuTestCode = @'
+using System;
+using System.Threading;
+using System.Security.Cryptography;
+
+public static class LaptopCpuTest {
+    private static byte[] data;
+    private static byte[] expected;
+    private static long[] counts = new long[0];
+    private static long[] errors = new long[0];
+    private static long crashed;
+    private static Thread[] threads = new Thread[0];
+
+    private static byte[] NewBuffer() {
+        byte[] buf = new byte[32 + data.Length];
+        Buffer.BlockCopy(data, 0, buf, 32, data.Length);
+        return buf;
+    }
+
+    // A fixed calculation with a known answer: SHA-256 chain + floating-point series.
+    private static byte[] Work(SHA256 sha, byte[] buf) {
+        byte[] digest = new byte[32];
+        for (int r = 0; r < 4; r++) {
+            Buffer.BlockCopy(digest, 0, buf, 0, 32);
+            digest = sha.ComputeHash(buf);
+        }
+        double acc = 0;
+        for (int i = 1; i < 200000; i++) acc += Math.Sqrt(i) * Math.Sin(i) / i;
+        byte[] result = new byte[40];
+        Buffer.BlockCopy(digest, 0, result, 0, 32);
+        Buffer.BlockCopy(BitConverter.GetBytes(acc), 0, result, 32, 8);
+        return result;
+    }
+
+    // Computes the correct answer on a cool CPU, then starts one worker per thread.
+    // Each worker repeats the calculation and compares it with that answer.
+    public static void Start(int threadCount, int seconds) {
+        data = new byte[1 << 20];
+        uint x = 2463534242u;
+        for (int i = 0; i < data.Length; i++) { x ^= x << 13; x ^= x >> 17; x ^= x << 5; data[i] = (byte)x; }
+        using (SHA256 sha = new SHA256CryptoServiceProvider()) { expected = Work(sha, NewBuffer()); }
+        counts = new long[threadCount];
+        errors = new long[threadCount];
+        crashed = 0;
+        DateTime end = DateTime.UtcNow.AddSeconds(seconds);
+        threads = new Thread[threadCount];
+        for (int t = 0; t < threadCount; t++) {
+            int idx = t;
+            threads[t] = new Thread(delegate () { Run(idx, end); });
+            threads[t].IsBackground = true;
+            threads[t].Start();
+        }
+    }
+
+    private static void Run(int idx, DateTime end) {
+        try {
+            byte[] buf = NewBuffer();
+            using (SHA256 sha = new SHA256CryptoServiceProvider()) {
+                while (DateTime.UtcNow < end) {
+                    byte[] r = Work(sha, buf);
+                    bool same = r.Length == expected.Length;
+                    for (int i = 0; same && i < r.Length; i++) same = r[i] == expected[i];
+                    if (!same) Interlocked.Increment(ref errors[idx]);
+                    Interlocked.Increment(ref counts[idx]);
+                }
+            }
+        } catch (Exception) {
+            Interlocked.Increment(ref crashed);
+        }
+    }
+
+    public static long TotalCount() { long s = 0; for (int i = 0; i < counts.Length; i++) s += Interlocked.Read(ref counts[i]); return s; }
+    public static long TotalErrors() { long s = 0; for (int i = 0; i < errors.Length; i++) s += Interlocked.Read(ref errors[i]); return s; }
+    public static long Crashed() { return Interlocked.Read(ref crashed); }
+
+    public static bool Wait(int timeoutMs) {
+        bool all = true;
+        foreach (Thread t in threads) all &= t.Join(timeoutMs);
+        return all;
+    }
+}
+'@
+
 if (-not $SkipStress) {
     if ($Seconds -lt 5) { $Seconds = 5 }
     Out-Section "6. CPU STRESS TEST ($Seconds s) + TEMPERATURES" 'Stress test'
@@ -509,42 +593,67 @@ if (-not $SkipStress) {
 
     $threads = [int]$cpu.NumberOfLogicalProcessors
     if ($threads -lt 1) { $threads = [Environment]::ProcessorCount }
-    Out-Line "  Loading all $threads threads for $Seconds s..."
-    $endTicks = [DateTime]::UtcNow.AddSeconds($Seconds).Ticks
-    $pool = [runspacefactory]::CreateRunspacePool(1, $threads)
-    $pool.Open()
+    $verified = $true
+    try { if (-not ('LaptopCpuTest' -as [type])) { Add-Type -TypeDefinition $CpuTestCode -Language CSharp -ReferencedAssemblies 'System.Core' -ErrorAction Stop } }
+    catch { $verified = $false; Add-Flag 'NOTE' "Calculation check unavailable ($($_.Exception.Message)) - running a plain load instead." }
     $jobs = @()
-    $burn = {
-        param($stopTicks)
-        $x = 1.0
-        while ([DateTime]::UtcNow.Ticks -lt $stopTicks) {
-            for ($j = 0; $j -lt 20000; $j++) { $x = [math]::Sqrt($x + $j) }
+    $pool = $null
+    if ($verified) {
+        Out-Line "  Loading all $threads threads for $Seconds s, verifying every calculation..."
+        [LaptopCpuTest]::Start($threads, $Seconds)
+    } else {
+        # Fallback: plain load without checking results
+        Out-Line "  Loading all $threads threads for $Seconds s..."
+        $stopTicks = [DateTime]::UtcNow.AddSeconds($Seconds).Ticks
+        $pool = [runspacefactory]::CreateRunspacePool(1, $threads)
+        $pool.Open()
+        $burn = {
+            param($stopTicks)
+            $x = 1.0
+            while ([DateTime]::UtcNow.Ticks -lt $stopTicks) {
+                for ($j = 0; $j -lt 20000; $j++) { $x = [math]::Sqrt($x + $j) }
+            }
+        }
+        for ($i = 0; $i -lt $threads; $i++) {
+            $ps = [powershell]::Create()
+            $ps.RunspacePool = $pool
+            [void]$ps.AddScript($burn).AddArgument($stopTicks)
+            $jobs += [pscustomobject]@{ PS = $ps; Handle = $ps.BeginInvoke() }
         }
     }
-    for ($i = 0; $i -lt $threads; $i++) {
-        $ps = [powershell]::Create()
-        $ps.RunspacePool = $pool
-        [void]$ps.AddScript($burn).AddArgument($endTicks)
-        $jobs += [pscustomobject]@{ PS = $ps; Handle = $ps.BeginInvoke() }
-    }
+    $endTicks = [DateTime]::UtcNow.AddSeconds($Seconds).Ticks
 
     $load = @()
+    $rates = @()
     $start = Get-Date
+    $prevT = $start
+    $prevN = [int64]0
     $null = Get-CpuSample
     while ([DateTime]::UtcNow.Ticks -lt $endTicks) {
         Start-Sleep -Milliseconds 2000
         $s = Get-CpuSample
-        $s.T = ((Get-Date) - $start).TotalSeconds
+        $now = Get-Date
+        $s.T = ($now - $start).TotalSeconds
         $load += $s
         $mhz = 'clock n/a'
         if ($s.PerfPct -and $s.BaseMHz) { $mhz = '~{0:N2} GHz' -f ($s.BaseMHz * $s.PerfPct / 100 / 1000) }
-        Out-Line ('    t={0,5:N1}s  CPU {1,5:N1}%  {2}  temp {3}' -f $s.T, $s.Util, $mhz, (TempStr $s.MaxT))
+        $extra = ''
+        if ($verified) {
+            $n = [LaptopCpuTest]::TotalCount()
+            $rate = ($n - $prevN) / [math]::Max(($now - $prevT).TotalSeconds, 0.001)
+            $prevN = $n
+            $prevT = $now
+            $rates += $rate
+            $extra = '  {0,6:N1} calc/s  errors {1}' -f $rate, [LaptopCpuTest]::TotalErrors()
+        }
+        Out-Line (('    t={0,5:N1}s  CPU {1,5:N1}%  {2}  temp {3}' -f $s.T, $s.Util, $mhz, (TempStr $s.MaxT)) + $extra)
     }
+    if ($verified) { [void][LaptopCpuTest]::Wait(15000) }
     foreach ($j in $jobs) {
         try { [void]$j.PS.EndInvoke($j.Handle) } catch {}
         $j.PS.Dispose()
     }
-    $pool.Close()
+    if ($pool) { $pool.Close() }
 
     Out-Line '  Cooling down for 10 s...'
     Start-Sleep -Seconds 8
@@ -589,6 +698,30 @@ if (-not $SkipStress) {
     }
     if ($null -ne $util -and $util -lt 80) { Add-Flag 'NOTE' ('CPU load only reached {0:N0}% - the result may be less reliable.' -f $util) }
     if ($null -ne $tPeak) { $Facts['Peak CPU temperature'] = TempStr $tPeak }
+
+    if ($verified) {
+        $total = [LaptopCpuTest]::TotalCount()
+        $wrong = [LaptopCpuTest]::TotalErrors()
+        $crashed = [LaptopCpuTest]::Crashed()
+        Out-KV 'Calculations verified' ('{0:N0} ({1} wrong)' -f $total, $wrong)
+        # Skip the first sample (workers still starting) and compare start vs end speed.
+        $speed = @($rates | Select-Object -Skip 1)
+        $drop = $null
+        if ($speed.Count -ge 4) {
+            $startRate = Get-Avg ($speed[0..1])
+            $endRate = Get-Avg ($speed[-2..-1])
+            if ($startRate) {
+                $drop = (1 - $endRate / $startRate) * 100
+                Out-KV 'Speed start -> end of test' ('{0:N1} -> {1:N1} calc/s ({2:+0;-0;+0}%)' -f $startRate, $endRate, [math]::Round(-$drop))
+            }
+        }
+        if ($wrong -gt 0) { Add-Flag 'RED' "CPU produced $wrong wrong results under load - unstable (overheating, undervolting/overclocking, or faulty CPU/RAM)." }
+        elseif ($total -gt 0) { Out-Ok ('All {0:N0} calculations under load were correct.' -f $total) }
+        else { Add-Flag 'YELLOW' 'The verified stress test did not run - result unknown.' }
+        if ($crashed -gt 0) { Add-Flag 'RED' "$crashed stress test worker(s) crashed under load." }
+        if ($null -ne $drop -and $drop -ge 50) { Add-Flag 'YELLOW' ('Speed fell {0:N0}% during the test - strong thermal/power throttling. (A drop of up to ~30% is normal when turbo boost ends.)' -f $drop) }
+        $Facts['CPU calculations'] = '{0:N0} verified, {1} wrong' -f $total, $wrong
+    }
 }
 
 # ---------------------------------------------------------------- 7. uptime

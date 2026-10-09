@@ -3,7 +3,8 @@
 laptop_check.py - inspect a used Windows 10/11 laptop before buying it.
 
 Checks CPU, RAM, disks (health / SMART), battery wear, Windows version and
-activation, runs a short CPU stress test with temperatures, reports uptime,
+activation, runs a short CPU stress test that verifies every calculation and
+measures temperatures, reports uptime,
 reads the crash / hardware error history and runs a quick RAM test.
 Prints a readable report with red flags and saves it to a text file.
 
@@ -25,7 +26,9 @@ import argparse
 import base64
 import ctypes
 import datetime as dt
+import hashlib
 import json
+import math
 import multiprocessing
 import os
 import re
@@ -700,11 +703,30 @@ def section_uptime(rep, w):
 # Stress test
 # --------------------------------------------------------------------------
 
-def _burn(stop_at):
-    x = 1
+def _verify_data():
+    # 1 MB of fixed pseudo-random data, identical in every process.
+    return b"".join(hashlib.sha256(i.to_bytes(4, "little")).digest() for i in range(32768))
+
+
+def _verified_work(data):
+    """A fixed calculation with a known answer: SHA-256 chain + floating-point series."""
+    digest = b""
+    for _ in range(4):
+        h = hashlib.sha256(digest)
+        h.update(data)
+        digest = h.digest()
+    acc = sum(math.sqrt(i) * math.sin(i) / i for i in range(1, 20000))
+    return digest + repr(acc).encode()
+
+
+def _stress_worker(stop_at, expected, idx, counts, errors):
+    # Each worker repeats the calculation and compares it with the answer computed
+    # before the load started. A different result means the CPU miscalculated.
+    data = _verify_data()
     while time.time() < stop_at:
-        for _ in range(20000):
-            x = (x * 48271) % 2147483647
+        if _verified_work(data) != expected:
+            errors[idx] += 1
+        counts[idx] += 1
 
 
 def stream_samples(seconds, interval_ms, on_sample=None):
@@ -754,26 +776,41 @@ def section_stress(rep, seconds, cpu):
     idle = stream_samples(4, 1000)
 
     threads = int(num(cpu.get("NumberOfLogicalProcessors")) or os.cpu_count() or 2)
-    rep.line(f"  Loading all {threads} threads for {seconds} s...")
+    rep.line(f"  Loading all {threads} threads for {seconds} s, verifying every calculation...")
+    expected = _verified_work(_verify_data())  # the correct answer, computed on a cool CPU
+    counts = multiprocessing.RawArray("q", threads)
+    errors = multiprocessing.RawArray("q", threads)
+    rates, last = [], {"t": time.time(), "n": 0}
 
     def show(s):
         perf, base = num(s.get("PerfPct")), num(s.get("BaseMHz"))
         mhz = f"~{base * perf / 100 / 1000:.2f} GHz" if perf and base else "clock n/a"
         t = max_temp([s])
+        now, done = time.time(), sum(counts)
+        rate = (done - last["n"]) / max(now - last["t"], 0.001)
+        last.update(t=now, n=done)
+        rates.append(rate)
         rep.line(f"    t={s['t']:5.1f}s  CPU {num(s.get('Util')) or 0:5.1f}%  {mhz}  "
-                 f"temp {f'{t:.0f} C' if t is not None else 'n/a'}")
+                 f"temp {f'{t:.0f} C' if t is not None else 'n/a'}  {rate:6.1f} calc/s  "
+                 f"errors {sum(errors)}")
 
     # The load runs slightly longer than the sampler, which needs ~1 s to start.
     sampler_args = (seconds, 2000)
     stop_at = time.time() + seconds + 1.5
-    workers = [multiprocessing.Process(target=_burn, args=(stop_at,), daemon=True) for _ in range(threads)]
+    workers = [multiprocessing.Process(target=_stress_worker, args=(stop_at, expected, i, counts, errors),
+                                       daemon=True) for i in range(threads)]
     for p in workers:
         p.start()
+    last["t"] = time.time()
     load = stream_samples(*sampler_args, on_sample=show)
+    crashed = 0
     for p in workers:
         p.join(timeout=10)
         if p.is_alive():
             p.terminate()
+        elif p.exitcode:
+            crashed += 1
+    total, wrong = sum(counts), sum(errors)
 
     rep.line("  Cooling down for 10 s...")
     time.sleep(8)
@@ -824,7 +861,30 @@ def section_stress(rep, seconds, cpu):
             rep.ok("No significant throttling detected.")
     if util is not None and util < 80:
         rep.flag(NOTE, f"CPU load only reached {util:.0f}% - the result may be less reliable.")
-    return t_peak
+
+    rep.kv("Calculations verified", f"{total:,} ({wrong} wrong)")
+    # Skip the first sample (workers still starting) and compare start vs end speed.
+    speed = rates[1:]
+    drop = None
+    if len(speed) >= 4:
+        start_rate, end_rate = avg(speed[:2]), avg(speed[-2:])
+        if start_rate:
+            drop = (1 - end_rate / start_rate) * 100
+            rep.kv("Speed start -> end of test", f"{start_rate:.1f} -> {end_rate:.1f} calc/s "
+                                                 f"({-round(drop):+d}%)")
+    if wrong:
+        rep.flag(RED, f"CPU produced {wrong} wrong results under load - unstable (overheating, "
+                      "undervolting/overclocking, or faulty CPU/RAM).")
+    elif total:
+        rep.ok(f"All {total:,} calculations under load were correct.")
+    else:
+        rep.flag(YELLOW, "The verified stress test did not run - result unknown.")
+    if crashed:
+        rep.flag(RED, f"{crashed} stress test worker(s) crashed under load.")
+    if drop is not None and drop >= 50:
+        rep.flag(YELLOW, f"Speed fell {drop:.0f}% during the test - strong thermal/power throttling. "
+                         "(A drop of up to ~30% is normal when turbo boost ends.)")
+    return {"peak": t_peak, "calc": f"{total:,} verified, {wrong} wrong"}
 
 
 # --------------------------------------------------------------------------
@@ -1203,9 +1263,9 @@ def main():
     disks = safe(section_disks, rep, admin) or []
     battery = safe(section_battery, rep, outdir, stamp)
     win = safe(section_windows, rep, system) or ({}, None)
-    peak = None
+    stress = None
     if not args.skip_stress:
-        peak = safe(section_stress, rep, max(5, args.seconds), cpu)
+        stress = safe(section_stress, rep, max(5, args.seconds), cpu)
     safe(section_uptime, rep, win[0])
     history = safe(section_history, rep, max(1, args.history_days))
     memtest = None
@@ -1220,8 +1280,10 @@ def main():
     facts.append(("Battery health", battery[1] if battery else "n/a"))
     facts.append(("Windows", f"{clean(win[0].get('Caption'))} - "
                              f"{'activated' if win[1] else 'NOT activated' if win[1] is False else 'activation unknown'}"))
-    if peak is not None:
-        facts.append(("Peak CPU temperature", f"{peak:.0f} C"))
+    if stress:
+        if stress["peak"] is not None:
+            facts.append(("Peak CPU temperature", f"{stress['peak']:.0f} C"))
+        facts.append(("CPU calculations", stress["calc"]))
     if history:
         facts.append((f"Last {args.history_days} days", history))
     if memtest:
