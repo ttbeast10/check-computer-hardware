@@ -26,6 +26,7 @@
 |------|-------------|-------|
 | `Run-LaptopCheck.bat` + `laptop_check.ps1` | **לא** | הכי פשוט אצל המוכר — לחיצה כפולה |
 | `laptop_check.py` | כן (בלי `pip install`) | אותן בדיקות, משתמש רק בכלים מובנים של Windows |
+| `laptop_check.sh` | לא (bash) | גרסה ל-**Linux** — משתמשת ב-`/proc`, `/sys`, `lsblk`, `smartctl`, `journalctl` |
 
 ## הוראות הרצה אצל המוכר (בלי פייתון)
 
@@ -46,6 +47,30 @@ python laptop_check.py
 אפשרויות: `--seconds 60` (עומס ארוך יותר), `--skip-stress` (בלי בדיקת עומס), `--skip-memtest` (בלי בדיקת זיכרון), `--memtest-seconds 120`, `--history-days 180`, `--no-admin`.
 
 בגרסת PowerShell: `-Seconds 60`, `-SkipStress`, `-SkipMemTest`, `-MemTestSeconds 120`, `-HistoryDays 180`.
+
+## הרצה ב-Linux (bash)
+
+```
+chmod +x laptop_check.sh
+sudo ./laptop_check.sh
+```
+
+אותן בדיקות כמו בגרסת Windows, אך מותאמות ל-Linux ומשתמשות בכלים שקיימים במערכת: `/proc` ו-`/sys`
+למעבד, זיכרון, סוללה וטמפרטורות, `lsblk` לכוננים, `smartctl` (smartmontools) לנתוני SMART,
+ו-`journalctl`/`dmesg` להיסטוריית שגיאות. `sudo` נדרש לנתוני SMART מלאים וליומן הקרנל.
+
+אפשרויות: `--seconds 60`, `--skip-stress`, `--skip-memtest`, `--memtest-seconds 120`, `--history-days 180`, `--no-pause`.
+
+בדיקת העומס מאמתת **כל חישוב** מול תשובה ידועה שחושבה לפני העומס (כמו בגרסת Windows), ומודדת טמפרטורות, בזמן שהבדיקה רצה. בדיקת הזיכרון כותבת וקוראת חזרה דפוסים ב-60% מהזיכרון הפנוי (עד 8GB).
+
+## בדיקות
+
+```
+bash tests/test_laptop_check.sh
+```
+
+הבדיקות מהירות ובטוחות: הן מריצות רק את פונקציות העזר (עיצוב גדלים, זמנים, ניתוח יומן, קריאת טמפרטורה
+מעץ sysfs מדומה וכו') ואינן מריצות את בדיקת העומס או בדיקת הזיכרון.
 
 ## דגלים אדומים עיקריים
 
