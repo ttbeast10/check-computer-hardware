@@ -20,12 +20,13 @@
 
 בסוף: סיכום עם **דגלים אדומים**, אזהרות, המלצה, ורשימת בדיקות ידניות (מסך, מקלדת, פורטים...).
 
-## שתי גרסאות — בחר אחת
+## שלוש גרסאות — בחר אחת
 
 | קובץ | צריך פייתון? | הערות |
 |------|-------------|-------|
 | `Run-LaptopCheck.bat` + `laptop_check.ps1` | **לא** | הכי פשוט אצל המוכר — לחיצה כפולה |
 | `laptop_check.py` | כן (בלי `pip install`) | אותן בדיקות, משתמש רק בכלים מובנים של Windows |
+| `laptop_check.sh` | **לא** (bash) | אותן בדיקות בשפת bash — הרצה מ-Git Bash / MSYS2 / Cygwin / WSL |
 
 ## הוראות הרצה אצל המוכר (בלי פייתון)
 
@@ -46,6 +47,21 @@ python laptop_check.py
 אפשרויות: `--seconds 60` (עומס ארוך יותר), `--skip-stress` (בלי בדיקת עומס), `--skip-memtest` (בלי בדיקת זיכרון), `--memtest-seconds 120`, `--history-days 180`, `--no-admin`.
 
 בגרסת PowerShell: `-Seconds 60`, `-SkipStress`, `-SkipMemTest`, `-MemTestSeconds 120`, `-HistoryDays 180`.
+
+## הרצה עם bash (Git Bash / MSYS2 / Cygwin / WSL)
+
+```sh
+./laptop_check.sh
+```
+
+אותן אפשרויות כמו בגרסת הפייתון: `--seconds 60`, `--skip-stress`, `--skip-memtest`, `--memtest-seconds 120`, `--history-days 180`, `--no-admin`, `--no-pause`.
+הסקריפט אוסף את נתוני החומרה דרך PowerShell / CIM, `powercfg` ו-`dsregcmd` (כמו גרסת הפייתון), ומחזיק את לוגיקת הבדיקות בשפת bash.
+
+### הרצת הבדיקות
+
+```sh
+./tests/run_all.sh
+```
 
 ## דגלים אדומים עיקריים
 
